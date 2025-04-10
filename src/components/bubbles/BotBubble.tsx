@@ -10,6 +10,93 @@ import { TickIcon, XIcon } from '../icons';
 import { SourceBubble } from '../bubbles/SourceBubble';
 import { DateTimeToggleTheme } from '@/features/bubble/types';
 
+/**
+ * Detects if text contains Arabic characters.
+ */
+function detectLanguage(text: string): 'ar-XA' | 'en-US' {
+  // Simple check for Arabic characters
+  return /[\u0600-\u06FF]/.test(text) ? 'ar-XA' : 'en-US';
+}
+
+/**
+ * Splits a single text string into language chunks based on detected script.
+ */
+function splitTextNodeByLanguage(text: string): { text: string; lang: 'ar-XA' | 'en-US' }[] {
+  // Regex explanation: Match sequences of Arabic chars OR sequences of non-Arabic chars.
+  // This is simpler than the previous complex regex and aims to group based on script blocks.
+  const segments = text.match(/[\u0600-\u06FF]+|[^\u0600-\u06FF]+/g) || [];
+  const chunks: { text: string; lang: 'ar-XA' | 'en-US' }[] = [];
+
+  segments.forEach((segment) => {
+    if (segment) {
+      // Ensure segment is not empty
+      const lang = detectLanguage(segment);
+      chunks.push({ text: segment, lang: lang });
+    }
+  });
+  // console.log("Split Text Node:", text, "-> Chunks:", chunks); // Debugging
+  return chunks;
+}
+
+/**
+ * Recursively traverses DOM nodes of a temporary fragment, identifies text nodes,
+ * splits them by language, wraps them in spans with 'dir' attributes,
+ * and returns the reconstructed HTML string.
+ */
+function parseAndWrapBidiRecursive(parentNode: Node): string {
+  let resultHtml = '';
+  parentNode.childNodes.forEach((node) => {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      // Handle element nodes (keep tags and attributes, recurse on children)
+      const element = node as Element;
+      // Ensure class attribute is handled correctly if it exists
+      const attributes = Array.from(element.attributes)
+        .map((attr) => `${attr.name}="${attr.value}"`)
+        .join(' ');
+      resultHtml += `<${element.tagName.toLowerCase()}${attributes ? ' ' + attributes : ''}>`;
+      resultHtml += parseAndWrapBidiRecursive(node); // Recursive call
+      resultHtml += `</${element.tagName.toLowerCase()}>`;
+    } else if (node.nodeType === Node.TEXT_NODE) {
+      // Handle text nodes (split by language and wrap)
+      const textContent = node.textContent || '';
+      const languageChunks = splitTextNodeByLanguage(textContent);
+      languageChunks.forEach((chunk) => {
+        const direction = chunk.lang === 'ar-XA' ? 'rtl' : 'ltr';
+        // Wrap non-empty text segments
+        if (chunk.text && chunk.text.trim() !== '') {
+          // Add display: inline-block; which often helps flow in mixed direction contexts
+          resultHtml += `<span dir="${direction}" style="display: inline-block;">${chunk.text}</span>`;
+        } else if (chunk.text) {
+          // Preserve whitespace if it was part of the text node
+          resultHtml += chunk.text;
+        }
+      });
+    } else if (node.nodeType === Node.COMMENT_NODE) {
+      // Optionally preserve comments
+      // resultHtml += ``;
+    }
+    // Ignore other node types
+  });
+  return resultHtml;
+}
+
+/**
+ * Takes an HTML string, parses it into a temporary DOM structure,
+ * processes it for bidi text wrapping using recursion, and returns the modified HTML string.
+ */
+function parseAndWrapBidiFromString(htmlString: string): string {
+  try {
+    // Create a temporary, disconnected DOM element to parse the HTML
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = htmlString;
+    // Process the children of the temporary div
+    return parseAndWrapBidiRecursive(tempDiv);
+  } catch (e) {
+    console.error('Error parsing/wrapping HTML string for bidi:', e);
+    return htmlString; // Return the original string if an error occurs
+  }
+}
+
 type Props = {
   message: MessageType;
   chatflowid: string;
@@ -199,12 +286,47 @@ export const BotBubble = (props: Props) => {
     }
   };
 
+  // ***** MODIFIED onMount HOOK *****
+  // This runs after the component's elements are first added to the DOM
   onMount(() => {
+    // Ensure the target element (botMessageEl span) exists
     if (botMessageEl) {
-      botMessageEl.innerHTML = Marked.parse(props.message.message);
+      const originalMessage = props.message.message;
+
+      // 1. Parse the original message using Marked (handles Markdown and potentially HTML)
+      let processedHtml = Marked.parse(originalMessage);
+
+      // 2. Check the original message content for Arabic characters
+      const hasArabic = /[\u0600-\u06FF]/.test(originalMessage);
+
+      // 3. Apply RTL handling if Arabic is detected
+      if (hasArabic) {
+        console.log('BotBubble: Applying RTL direction and bidi wrapping.');
+        // 3a. Set base direction and unicode-bidi style on the main bubble element (botMessageEl)
+        botMessageEl.dir = 'rtl';
+        botMessageEl.style.unicodeBidi = 'plaintext'; // Or 'isolate'. 'plaintext' often works well for inline mixing.
+        // Optional: Adjust text alignment if needed for the whole bubble.
+        // botMessageEl.style.textAlign = 'right';
+
+        // 3b. Process the HTML string (result of Marked.parse) to wrap inline LTR/RTL text segments
+        processedHtml = parseAndWrapBidiFromString(processedHtml);
+      } else {
+        // Ensure default LTR settings if no Arabic is detected
+        botMessageEl.dir = 'ltr';
+        botMessageEl.style.unicodeBidi = ''; // Reset style
+        botMessageEl.style.textAlign = ''; // Reset style
+      }
+
+      // 4. Set the final processed HTML content into the bubble element
+      botMessageEl.innerHTML = processedHtml;
+
+      // 5. Run original post-processing logic AFTER setting innerHTML
+      //    (Example: Make sure links open in new tabs)
       botMessageEl.querySelectorAll('a').forEach((link) => {
         link.target = '_blank';
       });
+
+      // Restore feedback rating state if it exists in the message data
       if (props.message.rating) {
         setRating(props.message.rating);
         if (props.message.rating === 'THUMBS_UP') {
@@ -213,25 +335,27 @@ export const BotBubble = (props: Props) => {
           setThumbsDownColor('#8B0000');
         }
       }
+
+      // Dynamically add file annotation buttons if they exist
       if (props.fileAnnotations && props.fileAnnotations.length) {
         for (const annotations of props.fileAnnotations) {
           const button = document.createElement('button');
           button.textContent = annotations.fileName;
           button.className =
-            'py-2 px-4 mb-2 justify-center font-semibold text-white focus:outline-none flex items-center disabled:opacity-50 disabled:cursor-not-allowed disabled:brightness-100 transition-all filter hover:brightness-90 active:brightness-75 file-annotation-button';
-          button.addEventListener('click', function () {
-            downloadFile(annotations);
-          });
+            'py-2 px-4 mb-2 justify-center font-semibold text-white focus:outline-none flex items-center disabled:opacity-50 disabled:cursor-not-allowed disabled:brightness-100 transition-all filter hover:brightness-90 active:brightness-75 file-annotation-button'; // Ensure all needed classes are here
+          button.addEventListener('click', () => downloadFile(annotations)); // Use arrow function for correct scope
+
           const svgContainer = document.createElement('div');
           svgContainer.className = 'ml-2';
           svgContainer.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-download" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="#ffffff" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" /><path d="M7 11l5 5l5 -5" /><path d="M12 4l0 12" /></svg>`;
 
           button.appendChild(svgContainer);
-          botMessageEl.appendChild(button);
+          botMessageEl.appendChild(button); // Append the button to the message element
         }
       }
-    }
+    } // End of if (botMessageEl)
 
+    // Logic to open agent reasoning details if loading
     if (botDetailsEl && props.isLoading) {
       botDetailsEl.open = true;
     }
